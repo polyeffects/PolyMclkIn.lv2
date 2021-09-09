@@ -36,9 +36,13 @@
 
 #define MCLK_IN_URI "http://polyeffects.com/lv2/mclk_in"
 
+#define TRIGGER_LENGTH 48 // 1 ms at 48kHz
+
 typedef enum {
 	MCLK_IN_CONTROL = 0,
-	MCLK_IN_BPM     = 1
+	MCLK_IN_BPM     = 1,
+	MCLK_IN_IS_RUNNING = 2,
+	MCLK_IN_START_TRIGGER = 3,
 } PortIndex;
 
 static const double dll_bandwidth = 6.0; // 1/Hz
@@ -55,11 +59,15 @@ typedef struct {
 	// Port buffers
 	const LV2_Atom_Sequence* control;
 	float*                   bpm;
+	float*                   is_running;
+	float*                   start_trigger;
 
 	uint32_t previous_time;
 	uint32_t sequence;
 	float previous_bpm;
 	bool dll_started;
+	bool run_state;
+	int trigger_countdown;
 
 	DelayLockedLoop dll;
 
@@ -85,8 +93,10 @@ instantiate(const LV2_Descriptor*     descriptor,
 	}
 	self->previous_time = 0;
 	self->sequence = 0;
+	self->trigger_countdown = 0;
 	self->previous_bpm = 120.0;
 	self->dll_started = false;
+	self->run_state = false;
 
 	// Scan host features for URID map
 	const char* missing = lv2_features_query(
@@ -120,6 +130,12 @@ connect_port(LV2_Handle instance,
 		break;
 	case MCLK_IN_BPM:
 		self->bpm = (float*)data;
+		break;
+	case MCLK_IN_IS_RUNNING:
+		self->is_running = (float*)data;
+		break;
+	case MCLK_IN_START_TRIGGER:
+		self->start_trigger = (float*)data;
 		break;
 	}
 }
@@ -165,6 +181,11 @@ run(LV2_Handle instance, uint32_t sample_count)
 	Mclk_in* self   = (Mclk_in*)instance;
 	uint32_t  offset = 0;
 	float* const bpm = self->bpm;
+	float* const is_running = self->is_running;
+	float* const start_trigger = self->start_trigger;
+
+	int trigger_countdown = self->trigger_countdown;
+	bool run_state = self->run_state;
 
 
 	LV2_ATOM_SEQUENCE_FOREACH(self->control, ev) {
@@ -172,10 +193,16 @@ run(LV2_Handle instance, uint32_t sample_count)
 			const uint8_t* const msg = (const uint8_t*)(ev + 1);
 			switch (lv2_midi_message_type(msg)) {
 			case LV2_MIDI_MSG_START:
+				trigger_countdown = TRIGGER_LENGTH;
+				run_state = true;
 				break;
 			case LV2_MIDI_MSG_STOP:
+				trigger_countdown = 0;
+				run_state = false;
 				break;
 			case LV2_MIDI_MSG_CONTINUE:
+				trigger_countdown = TRIGGER_LENGTH;
+				run_state = true;
 				break;
 			case LV2_MIDI_MSG_CLOCK:
 				// if this is the first message, set initial time
@@ -207,6 +234,20 @@ run(LV2_Handle instance, uint32_t sample_count)
 	}
 	self->sequence = self->sequence + sample_count;
 	bpm[0] = self->previous_bpm;
+	for (uint32_t s = 0; s < sample_count; ++s) {
+		if (trigger_countdown > 0){
+			trigger_countdown--;
+			start_trigger[s] = 1.0f;
+		}
+		else {
+			start_trigger[s] = 0.0f;
+		}
+		is_running[s] = (float) run_state;
+	}
+
+	self->trigger_countdown = trigger_countdown;
+	self->run_state = run_state;
+	
 }
 
 /**
