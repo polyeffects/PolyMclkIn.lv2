@@ -43,6 +43,9 @@ typedef enum {
 	MCLK_IN_BPM     = 1,
 	MCLK_IN_IS_RUNNING = 2,
 	MCLK_IN_START_TRIGGER = 3,
+	MCLK_IN_BANDWIDTH_PARAM = 4,
+	MCLK_IN_DIVIDER_PARAM = 5,
+	MCLK_IN_PULSE_OUT = 6,
 } PortIndex;
 
 static const double dll_bandwidth = 6.0; // 1/Hz
@@ -61,6 +64,9 @@ typedef struct {
 	float*                   bpm;
 	float*                   is_running;
 	float*                   start_trigger;
+	const float*             bandwidth_param;
+	const float*             divider;
+	float*                   pulse_out;
 
 	uint32_t previous_time;
 	uint32_t sequence;
@@ -68,6 +74,9 @@ typedef struct {
 	bool dll_started;
 	bool run_state;
 	int trigger_countdown;
+	int pulse_countdown;
+	int pulse_count;
+	double current_dll_bandwidth;
 
 	DelayLockedLoop dll;
 
@@ -94,9 +103,12 @@ instantiate(const LV2_Descriptor*     descriptor,
 	self->previous_time = 0;
 	self->sequence = 0;
 	self->trigger_countdown = 0;
+	self->pulse_countdown = 0;
+	self->pulse_count = 0;
 	self->previous_bpm = 120.0;
 	self->dll_started = false;
 	self->run_state = false;
+	self->current_dll_bandwidth = dll_bandwidth;
 
 	// Scan host features for URID map
 	const char* missing = lv2_features_query(
@@ -137,6 +149,15 @@ connect_port(LV2_Handle instance,
 	case MCLK_IN_START_TRIGGER:
 		self->start_trigger = (float*)data;
 		break;
+	case MCLK_IN_BANDWIDTH_PARAM:
+		self->bandwidth_param = (const float*)data;
+		break;
+	case MCLK_IN_DIVIDER_PARAM:
+		self->divider = (const float*)data;
+		break;
+	case MCLK_IN_PULSE_OUT:
+		self->pulse_out = (float*)data;
+		break;
 	}
 }
 
@@ -152,8 +173,8 @@ activate(LV2_Handle instance)
  * initialize DLL
  * set current time and period in samples
  */
-static void init_dll(DelayLockedLoop *dll, double tme, double period) {
-  const double omega = 2.0 * M_PI * period / dll_bandwidth / samplerate;
+static void init_dll(DelayLockedLoop *dll, double tme, double period, double bandwidth) {
+  const double omega = 2.0 * M_PI * period / bandwidth / samplerate;
   dll->b = 1.4142135623730950488 * omega;
   dll->c = omega * omega;
 
@@ -183,9 +204,20 @@ run(LV2_Handle instance, uint32_t sample_count)
 	float* const bpm = self->bpm;
 	float* const is_running = self->is_running;
 	float* const start_trigger = self->start_trigger;
+	float* const pulse_out = self->pulse_out;
+	const float bandwidth_param = *(self->bandwidth_param);
+	const float divider = *(self->divider);
 
 	int trigger_countdown = self->trigger_countdown;
+	int pulse_countdown = self->pulse_countdown;
+	int pulse_count = self->pulse_count;
 	bool run_state = self->run_state;
+	
+	if (self->current_dll_bandwidth != bandwidth_param){
+		self->current_dll_bandwidth = bandwidth_param;
+		self->dll_started = false;
+		self->previous_time = 0;
+	}
 
 
 	LV2_ATOM_SEQUENCE_FOREACH(self->control, ev) {
@@ -195,6 +227,11 @@ run(LV2_Handle instance, uint32_t sample_count)
 			case LV2_MIDI_MSG_START:
 				trigger_countdown = TRIGGER_LENGTH;
 				run_state = true;
+				// if current BPM to slow or too fast, restart DLL
+				if (self->previous_bpm < 15 || self->previous_bpm > 300){
+					self->dll_started = false;
+					self->previous_time = 0;
+				}
 				break;
 			case LV2_MIDI_MSG_STOP:
 				trigger_countdown = 0;
@@ -210,12 +247,17 @@ run(LV2_Handle instance, uint32_t sample_count)
 				//
 				//
 				offset = ev->time.frames + self->sequence; 
+				pulse_count++;
+				if (pulse_count >= divider){
+					pulse_count = 0;
+					pulse_out[ev->time.frames] = 1.0f;
+				};
 				if (self->previous_time == 0){
 					self->previous_time = offset; 
 				}
 				else if (!self->dll_started) {
 					/* 2nd event in sequence -> initialize DLL with time difference */
-					init_dll(&self->dll, offset, (offset - self->previous_time));
+					init_dll(&self->dll, offset, (offset - self->previous_time), self->current_dll_bandwidth);
 					self->previous_bpm = samplerate * 60.0 / (24.0 * (double)(offset - self->previous_time));
 					self->dll_started = true;
 					/* fprintf (stderr, "initial set %f", self->previous_bpm); */
@@ -242,10 +284,21 @@ run(LV2_Handle instance, uint32_t sample_count)
 		else {
 			start_trigger[s] = 0.0f;
 		}
+		if (pulse_out[s] > 0.9f){// we've set it to on
+			pulse_countdown = TRIGGER_LENGTH;
+		} else if (pulse_countdown > 0){
+			pulse_countdown--;
+			pulse_out[s] = 1.0f;
+		}
+		else {
+			pulse_out[s] = 0.0f;
+		}
 		is_running[s] = (float) run_state;
 	}
 
 	self->trigger_countdown = trigger_countdown;
+	self->pulse_countdown = pulse_countdown;
+	self->pulse_count = pulse_count;
 	self->run_state = run_state;
 	
 }
